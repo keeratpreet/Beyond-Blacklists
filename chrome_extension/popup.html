@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>PhishGuard</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        width: 320px;
+        margin: 0;
+        padding: 12px;
+        box-sizing: border-box;
+        background: #ffffff;
+        color: #111827;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 6px;
+        font-weight: 750;
+        letter-spacing: 0.2px;
+        color: #111827;
+      }
+      .brand-accent {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #eef2ff;
+        border: 1px solid #c7d2fe;
+        color: #3730a3;
+      }
+      p {
+        font-size: 12px;
+        color: #4b5563;
+        margin: 0 0 10px;
+        line-height: 1.4;
+      }
+      button {
+        width: 100%;
+        padding: 8px 10px;
+        font-size: 13px;
+        cursor: pointer;
+        border-radius: 6px;
+        border: 1px solid #d1d5db;
+        background: #f9fafb;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: wait;
+      }
+      pre {
+        font-size: 11px;
+        background: #111;
+        color: #e6e6e6;
+        padding: 8px;
+        border-radius: 6px;
+        overflow-x: auto;
+        max-height: 220px;
+        margin: 10px 0 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .err {
+        color: #b00020;
+        font-size: 12px;
+        margin-top: 8px;
+      }
+      #alertBox {
+        padding: 10px;
+        margin-top: 10px;
+        border-radius: 10px;
+        font-size: 13px;
+        font-weight: 600;
+        border: 1px solid transparent;
+      }
+
+      .alert-danger {
+        background: #fff1f2;
+        color: #9f1239;
+        border-color: #fecdd3;
+      }
+
+      .alert-safe {
+        background: #ecfdf5;
+        color: #065f46;
+        border-color: #a7f3d0;
+      }
+
+      .kv {
+        margin-top: 10px;
+        padding: 10px;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        background: #ffffff;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        justify-content: space-between;
+        align-items: baseline;
+        padding: 6px 0;
+        border-top: 1px solid #f3f4f6;
+      }
+      .row:first-child {
+        border-top: none;
+        padding-top: 0;
+      }
+      .k {
+        font-size: 11px;
+        color: #6b7280;
+        flex: 0 0 auto;
+      }
+      .v {
+        font-size: 12px;
+        color: #111827;
+        text-align: right;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 220px;
+      }
+      .muted {
+        font-size: 11px;
+        color: #6b7280;
+        margin-top: 8px;
+      }
+      .btn-secondary {
+        margin-top: 10px;
+        background: #ffffff;
+      }
+    </style>
+  </head>
+  <body>
+    <h1><span class="brand-accent">PhishGuard</span> </h1>
+    <p>
+      Checks whether the current site is phishing or benign.
+    </p>
+    <button id="go" type="button">Analyze visible tab</button>
+    <div id="err" class="err" hidden></div>
+    <div id="alertBox" hidden></div>
+
+    <div id="summary" class="kv" hidden>
+      <div class="row">
+        <div class="k">Site</div>
+        <div class="v" id="site"></div>
+      </div>
+      <div class="row">
+        <div class="k">Verdict</div>
+        <div class="v" id="verdict"></div>
+      </div>
+      <div class="row">
+        <div class="k">Brand</div>
+        <div class="v" id="brand"></div>
+      </div>
+    </div>
+
+    <button id="toggleDetails" class="btn-secondary" type="button" hidden>
+      Show details
+    </button>
+    <div id="details" hidden>
+      <pre id="out" hidden></pre>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

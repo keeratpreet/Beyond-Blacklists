@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "PhishGuard Local",
+  "version": "2.0.0",
+  "description": "Real-time phishing detection using YOLOv8 visual branch + Heuristic+ML URL branch (local server).",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Check this page for phishing"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting",
+    "captureVisibleTab"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*"
+  ]
+}
