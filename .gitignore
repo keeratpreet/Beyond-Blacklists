@@ -37,3 +37,6 @@ results.txt
 balanced_results.txt
 eval_2000_results.json
 outputs/
+
+# Meta scripts (not part of the project)
+PUSH_TO_GITHUB.sh
