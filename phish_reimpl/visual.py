@@ -141,6 +141,8 @@ class VisualAnalyzer:
 
     # convert umg to RGB , resize , normalise , and return a normalised feature vector 
     def _embed_image(self, image: Image.Image) -> np.ndarray:
+        # pad to square (preserving aspect ratio) before the fixed 128x128
+        # resize, so a wide/tall logo crop isn't stretched out of proportion
         image = image.convert("RGB")
         pad = (
             (max(image.size) - image.size[0]) // 2,
@@ -272,8 +274,11 @@ class VisualAnalyzer:
         logo_boxes = instances.pred_boxes[instances.pred_classes == 1].tensor
         return logo_boxes.detach().cpu().numpy()
 
-#matches the logo box with the reference logo embeddings 
     def _match_crop(self, screenshot_path: Path, bbox: np.ndarray) -> tuple[str | None, list[str] | None, float | None]:
+        # crop the detected logo region and embed it, then compare against
+        # every reference logo at once via a single matrix-vector product
+        # (reference_matrix is pre-stacked, one row per reference embedding —
+        # since embeddings are L2-normalized, the dot product IS cosine similarity)
         screenshot = Image.open(screenshot_path)
         crop = screenshot.crop(tuple(float(v) for v in bbox))
         crop_embedding = self._embed_image(crop)
@@ -286,10 +291,17 @@ class VisualAnalyzer:
         top_scores = [float(similarities[idx]) for idx in top_indices]
         lead_brand = top_entries[0].brand
 
+        # only consider candidates agreeing with the single best (lead) brand —
+        # avoids accepting a weaker match to a different brand just because it
+        # narrowly beat the threshold
         for entry, score in zip(top_entries, top_scores):
             if entry.brand != lead_brand:
                 continue
             final_score = score
+            # borderline case: re-embed both images at matched resolution and
+            # re-score, since resizing both crop and reference to the same
+            # fixed 128x128 can lose detail that a resolution-matched
+            # comparison recovers
             if score < self.similarity_threshold:
                 ref_logo = Image.open(entry.file_path)
                 aligned_crop, aligned_logo = _align_resolution(crop, ref_logo)
@@ -298,6 +310,8 @@ class VisualAnalyzer:
                 final_score = float(aligned_logo_embedding.dot(aligned_crop_embedding))
             if final_score >= self.similarity_threshold:
                 return entry.brand, entry.domains, final_score
+        # no candidate cleared the threshold — return the top score anyway so
+        # the caller can report "closest guess" without claiming a match
         return None, None, top_scores[0]
     
     # domain consistency check

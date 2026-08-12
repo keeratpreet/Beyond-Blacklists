@@ -399,6 +399,11 @@ class URLAnalyzer:
                     self._token_index[candidate] = (brand, is_short)
 
     def infer_brand(self, url: str) -> tuple[str | None, list[str] | None, str | None]:
+        # self._token_index is a precomputed {token: (brand, is_short)} map built
+        # once at load time from all 270 brands' name variants, so this is a
+        # single pass over that small token set (not a scan of the brand list
+        # per call) — checks hostname first, falls back to path, and keeps
+        # whichever match has the longest (most specific) token
         parsed = urlparse(url)
         hostname = parsed.hostname or ""
         hostname_key = normalize_text(hostname)

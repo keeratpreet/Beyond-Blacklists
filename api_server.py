@@ -186,6 +186,10 @@ async def analyze(
     # ── Explicit URL-only mode (PHISH_URL_ONLY=1) ────────────────────────────
     if _url_only is not None:
         url_out = _url_only.analyze(u)
+        # URL-only mode never produces a real ResultRow (that's built by
+        # PhishingPipeline.analyze_case, which isn't invoked here) — this
+        # builds a minimal stand-in object with the same attributes so
+        # _result_to_response() can stay a single shared code path for both modes
         row_like = type("R", (), {
             "case_id":         case_id,
             "url":             u,
@@ -202,6 +206,9 @@ async def analyze(
         return _result_to_response(row_like, mode="url_only")
 
     # ── Full YOLOv8 + URL pipeline ───────────────────────────────────────────
+    # the visual pipeline (YOLO + PIL) expects a file path, not raw bytes, so
+    # the uploaded screenshot is spooled to a temp file for the duration of
+    # this request and always cleaned up in the `finally` block below
     tmp_path: Path | None = None
     try:
         import tempfile as _tmp
