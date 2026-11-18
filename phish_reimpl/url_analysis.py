@@ -12,6 +12,10 @@ from urllib.parse import urlparse
 import pandas as pd
 import tldextract
 
+from phish_reimpl.impersonation import (
+    brand_hint, brand_in_url, credential_page, has_credential_field,
+)
+
 
 SUSPICIOUS_KEYWORDS = (
     "login", "signin", "secure", "verify", "update", "account",
@@ -32,7 +36,26 @@ _FREE_HOSTS = frozenset({
     "dyndns.org", "yolasite.com", "weblium.site", "bravesites.com",
     "wordpress.com", "blogspot.com", "tumblr.com", "godaddysites.com",
     "squarespace.com", "webflow.io", "carrd.co",
+    "workers.dev", "r2.dev", "framer.app", "framer.website", "typedream.app",
+    "sites.google.com",
 })
+
+# Corrections for known errors in the scraped domain_map.pkl
+# (e.g. "python" only listed egenix.com, so python.org looked like an impostor).
+_DOMAIN_MAP_FIXES: dict[str, list[str]] = {
+    "python": ["python.org"],
+    "stackoverflow": ["stackoverflow.com"],
+    "Bank of America": ["bofa.com"],
+    "DHL Airways": ["dhl.com", "dhl.de", "dhl.co.uk"],
+    "eBay": ["ebay.com", "ebay.co.uk", "ebay.de", "ebay.fr", "ebay.it", "ebay.es", "ebay.com.au", "ebay.ca"],
+    "Naver": ["naver.com"],
+}
+# Extra brand nicknames that phishing URLs use but the domain map lacks.
+_BRAND_ALIASES: dict[str, str] = {"bofa": "Bank of America"}
+
+# Brand tokens shorter than this must match a whole hostname part
+# ("line" must not match inside "onlinesbi", "start" not inside "kickstarter").
+_MIN_SUBSTRING_TOKEN = 6
 
 # RFC 2606 / IANA reserved test domains — never real phishing targets.
 # URLs like "paypal-secure.example.org" are test/anonymized entries, not real phishing.
@@ -79,7 +102,7 @@ _TLDEXTRACT = tldextract.TLDExtract(
 )
 
 # ML confidence threshold when using the model as a standalone no-brand classifier
-_STANDALONE_ML_THRESHOLD = 0.80
+_STANDALONE_ML_THRESHOLD = 0.90   # "flag only when sure" (was 0.80)
 # ML confidence threshold when used as a borderline heuristic supplement
 _BORDERLINE_ML_THRESHOLD = 0.90
 
@@ -91,6 +114,9 @@ class URLDecision:
     matched_domain: list[str] | None
     risk_score: float
     analysis_time: float
+    # Why the page was flagged, or (with prediction 0) a weaker clue worth a
+    # warning, e.g. "'paypal' in a vercel.app subdomain". None if nothing.
+    reason: str | None = None
 
 
 def normalize_text(text: str) -> str:
@@ -117,15 +143,44 @@ def _safe_entropy(s: str) -> float:
 
 
 def _registered_domain_label(hostname: str) -> str:
-    parts = hostname.lower().split(".")
-    rd = ".".join(parts[-2:]) if len(parts) >= 2 else hostname
-    return rd.split(".")[0] if "." in rd else rd
+    # Use the public-suffix list so "irctc.co.in" gives "irctc", not "co".
+    ext = _TLDEXTRACT(hostname.lower())
+    return ext.domain or hostname.lower()
+
+
+def _is_restricted_registry(hostname: str) -> bool:
+    """True for .gov / .mil / .edu style suffixes (incl. gov.uk, edu.au, gouv.fr).
+
+    These cannot be registered by just anyone, so the URL model alone is not
+    allowed to flag them; only a brand-impersonation rule can.
+    """
+    suffix = _TLDEXTRACT(hostname.lower()).suffix
+    return any(p in {"gov", "mil", "edu", "gouv"} for p in suffix.split("."))
+
+
+def hostname_only_url(url: str) -> str:
+    """Reduce a URL to https://<hostname> before it reaches the URL model.
+
+    Every benign URL in the RF's training data (PhiUSIIL, url_corpus_14k,
+    url_only_full) is a bare domain with no path or trailing slash, while
+    phishing URLs carry paths. The model therefore learned "has a path / '/'
+    / http" == phishing and scores almost every real browser URL ~1.0.
+    Feeding it only the hostname removes that shortcut.
+    """
+    hostname = (urlparse(url.strip()).hostname or "").lower()
+    return f"https://{hostname}" if hostname else url
 
 
 def _is_free_host(hostname: str) -> bool:
-    """Return True if the hostname is on a known free/shared hosting provider."""
-    h = hostname.lower()
-    return any(fh in h for fh in _FREE_HOSTS)
+    """Return True if the hostname is user content on a free/shared hosting provider.
+
+    The provider's own site (squarespace.com, wix.com) is not user content.
+    """
+    h = hostname.lower().rstrip(".")
+    if h.startswith("www."):
+        h = h[4:]
+    # sites.google.com hosts user pages under its path, not subdomains
+    return h == "sites.google.com" or any(h.endswith("." + fh) for fh in _FREE_HOSTS)
 
 
 def extract_url_features(url: str) -> dict[str, float]:
@@ -349,6 +404,21 @@ class URLAnalyzer:
     ):
         with domain_map_path.open("rb") as f:
             self.domain_map: dict[str, list[str]] = pickle.load(f)
+        for brand, extra in _DOMAIN_MAP_FIXES.items():
+            if brand in self.domain_map:
+                known = list(self.domain_map[brand])
+                self.domain_map[brand] = known + [d for d in extra if d not in known]
+        # Every registered domain that is official for *some* brand. A page on
+        # one of these is the real site even if a different brand token matched.
+        self._all_official: frozenset[str] = frozenset(
+            registered_domain(d.lower()) for doms in self.domain_map.values() for d in doms
+        )
+        # Popular real domains that contain a brand name (amazonaws, cdninstagram…)
+        legit_file = domain_map_path.parent / "brand_named_domains.txt"
+        self._known_legit: frozenset[str] = frozenset(
+            l.strip() for l in legit_file.read_text().splitlines()
+            if l.strip() and not l.startswith("#")
+        ) if legit_file.exists() else frozenset()
         self.model = None
         self.html_model = None
         self.heuristic_threshold = heuristic_threshold
@@ -397,6 +467,9 @@ class URLAnalyzer:
                 existing = self._token_index.get(candidate)
                 if existing is None or len(candidate) > len(existing[0]):
                     self._token_index[candidate] = (brand, is_short)
+        for alias, brand in _BRAND_ALIASES.items():
+            if brand in self.domain_map:
+                self._token_index[normalize_text(alias)] = (brand, True)
 
     def infer_brand(self, url: str) -> tuple[str | None, list[str] | None, str | None]:
         # self._token_index is a precomputed {token: (brand, is_short)} map built
@@ -407,8 +480,9 @@ class URLAnalyzer:
         parsed = urlparse(url)
         hostname = parsed.hostname or ""
         hostname_key = normalize_text(hostname)
-        hostname_labels = {normalize_text(part) for part in hostname.split(".") if part}
+        hostname_labels = {normalize_text(part) for part in re.split(r"[.\-]", hostname) if part}
         path_key = normalize_text(parsed.path or "")
+        path_labels = {normalize_text(p) for p in re.split(r"[/_.\-?=&]+", parsed.path or "") if p}
         best_brand = None
         best_source = None
         best_score = 0
@@ -417,6 +491,10 @@ class URLAnalyzer:
             if is_short:
                 matches_hostname = token in hostname_labels
                 matches_path = False
+            elif len(token) < _MIN_SUBSTRING_TOKEN:
+                # 4-letter tokens: whole hostname/path parts only
+                matches_hostname = token in hostname_labels
+                matches_path = token in path_labels
             else:
                 matches_hostname = token in hostname_key
                 matches_path = token in path_key
@@ -438,6 +516,10 @@ class URLAnalyzer:
         """Return ML model phishing probability for a URL (0.0 if no model)."""
         if self.model is None:
             return 0.0
+        # Models retrained on real inner-page URLs (path_aware_ = True) see the
+        # full URL; the original shortcut-prone model only sees the hostname.
+        if not getattr(self.model, "path_aware_", False):
+            url = hostname_only_url(url)
         feats = extract_url_features(url)
         df = pd.DataFrame([feats])
         # Align columns to what the model was trained on
@@ -489,25 +571,67 @@ class URLAnalyzer:
                 brand, domains, _ = self.infer_brand(url)
                 return URLDecision(1, brand, domains, html_prob, time.time() - start)
 
+        on_free = _is_free_host(hostname)
+        current = registered_domain(hostname)
+
+        # ── Official domain of *any* known brand → real site ─────────────────
+        # (stops e.g. a "python" brand match from flagging python.org)
+        if current in self._all_official and not on_free:
+            return URLDecision(0, None, None, 0.0, time.time() - start)
+
+        # ── Impersonation rules ("flag only when sure", see impersonation.py) ──
+        # 1. URL alone: brand glued into a made-up domain in a pattern real
+        #    companies don't use (732890coinbase.com, lhttps-www--roblox.com).
+        hit = brand_in_url(url)
+        if hit:
+            return URLDecision(1, hit[0], self.domain_map.get(hit[0]), 0.95,
+                               time.time() - start, reason=hit[1])
+        # 2. Page content: a login/payment form AND (the page title names a
+        #    brand this site isn't, or a brand clue in the URL).
+        hint = brand_hint(url, self._known_legit)
+        if html:
+            hit = credential_page(url, html, self._all_official)
+            if hit:
+                return URLDecision(1, hit[0], self.domain_map.get(hit[0]), 0.95,
+                                   time.time() - start, reason=hit[1])
+            if hint and has_credential_field(html):
+                return URLDecision(1, hint[0], self.domain_map.get(hint[0]), 0.90,
+                                   time.time() - start, reason=f"login/payment form + {hint[1]}")
+        clue = f"suspicious: {hint[1]}" if hint else None
+
         brand, domains, source = self.infer_brand(url)
+        # .gov / .mil / .edu: the RF alone may not flag these (see helper)
+        use_ml = self.model is not None and not _is_restricted_registry(hostname)
 
         # ── No brand detected: use URL ML model as standalone classifier ─────
         if brand is None or domains is None:
-            if self.model is not None:
+            if use_ml:
                 ml_prob = self._run_url_ml(url)
                 if ml_prob >= self.standalone_ml_threshold:
-                    return URLDecision(1, None, None, ml_prob, time.time() - start)
-            return URLDecision(0, None, None, 0.0, time.time() - start)
+                    return URLDecision(1, None, None, ml_prob, time.time() - start, reason="URL model")
+            return URLDecision(0, None, None, 0.0, time.time() - start, reason=clue)
 
         # ── Brand detected: check official domain ─────────────────────────────
         official = {registered_domain(domain.lower()) for domain in domains}
-        current = registered_domain(hostname)
 
         # Only clear as official if NOT on a free-hosting platform.
         # Attackers routinely abuse appspot.com, herokuapp.com, etc.
-        on_free = _is_free_host(hostname)
         if current in official and not on_free:
             return URLDecision(0, brand, domains, 0.0, time.time() - start)
+
+        # ── Brand's real domain in front of a different one ──────────────────
+        # paypal.com.secure-login.net: certain impersonation. Must sit on dot
+        # boundaries (9to5google.com is not google.com), and country variants
+        # with the same name (google.com.au, amazon.com.br, roblox.com.gt) are
+        # NOT flagged here: from the URL alone we can't tell the brand's real
+        # local site from a fake, so the logo / login-form checks decide those.
+        dotted = "." + hostname + "."
+        cur_label = _registered_domain_label(hostname)
+        if any(f".{o}." in dotted and not dotted.endswith(f".{o}.") and "." in o
+               and _registered_domain_label(o) != cur_label
+               for o in official if o):
+            return URLDecision(1, brand, domains, 0.95, time.time() - start,
+                               reason=f"{brand}'s real domain placed in front of a different domain")
 
         # ── Heuristic scoring ─────────────────────────────────────────────────
         score = 0.0
@@ -535,10 +659,11 @@ class URLAnalyzer:
         pred = int(score >= self.heuristic_threshold)
 
         # ── ML supplement for borderline cases ───────────────────────────────
-        if pred == 0 and self.model is not None and score >= self.borderline_threshold:
+        if pred == 0 and use_ml and score >= self.borderline_threshold:
             ml_prob = self._run_url_ml(url)
             if ml_prob >= self.ml_conf_threshold:
                 pred = 1
                 score = max(score, ml_prob)
 
-        return URLDecision(pred, brand, domains, min(score, 1.0), time.time() - start)
+        why = (f"URL heuristics for {brand}" if pred else clue)
+        return URLDecision(pred, brand, domains, min(score, 1.0), time.time() - start, reason=why)

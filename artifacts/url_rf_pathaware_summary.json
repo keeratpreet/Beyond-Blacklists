@@ -1,0 +1,13 @@
+{
+ "rows": 287646,
+ "phish": 102757,
+ "benign_bare": 160009,
+ "benign_crawled": 24880,
+ "dropped_features": [
+  "has_https"
+ ],
+ "n_estimators": 150,
+ "min_samples_leaf": 8,
+ "max_depth": 28,
+ "leakage_filter": "all test-set registered domains removed"
+}

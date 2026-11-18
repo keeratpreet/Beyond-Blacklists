@@ -106,6 +106,20 @@ document.getElementById("go").addEventListener("click", async () => {
     form.append("url", tab.url);
     form.append("screenshot", blob, "shot.png");
 
+    // Page HTML lets the server check for a login/payment form on a site that
+    // names a brand it is not. Optional: some pages (chrome web store, PDFs)
+    // cannot be scripted, and the check is simply skipped.
+    try {
+      const [{ result: html }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => document.documentElement.outerHTML,
+      });
+      // sent as a file: the server caps plain text fields at 1 MB
+      if (typeof html === "string") form.append("html", new Blob([html], { type: "text/html" }), "page.html");
+    } catch {
+      /* not scriptable: send URL + screenshot only */
+    }
+
     const res = await fetch(`${API_BASE}/analyze`, { method: "POST", body: form });
     const text = await res.text();
     let body;
@@ -136,10 +150,11 @@ document.getElementById("go").addEventListener("click", async () => {
 
     if (body.final_pred === 1) {
       // Phishing: brand impersonation confirmed
-      showAlert(
-        brand ? `⚠️ Suspicious — impersonating ${brand}` : "⚠️ Suspicious site detected",
-        "danger"
-      );
+      const head = brand ? `⚠️ Suspicious — impersonating ${brand}` : "⚠️ Suspicious site detected";
+      showAlert(body.reason ? `${head}\nWhy: ${body.reason}` : head, "danger");
+    } else if (body.reason && body.reason.startsWith("suspicious")) {
+      // Not sure enough to flag, but worth a caution
+      showAlert(`⚠️ Be careful — ${body.reason.replace(/^suspicious: /, "")}. Don't enter passwords here.`, "danger");
     } else if (brand) {
       // Benign with brand detected
       const safeMsg = domainVerified
@@ -178,6 +193,7 @@ document.getElementById("go").addEventListener("click", async () => {
         url_pred: body.url_pred,
         visual_pred: body.visual_pred,
         url_risk: body.url_risk,
+        reason: body.reason,
         confidence: body.confidence,
         timing_s: { url: body.url_time, visual: body.visual_time },
       },

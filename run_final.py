@@ -24,7 +24,8 @@ from phish_reimpl.url_analysis import URLAnalyzer
 from phish_reimpl.visual_yolo import YoloVisualAnalyzer
 
 # ── Model paths ──────────────────────────────────────────────────────────────
-URL_MODEL  = REPO / "artifacts" / "url_rf_combined.pkl"
+from phish_reimpl.inference import url_model_path
+URL_MODEL  = url_model_path(REPO)
 DOMAIN_MAP = REPO / "assets" / "models" / "domain_map.pkl"
 YOLO_PT    = REPO / "yolo" / "best.pt"
 
@@ -35,7 +36,8 @@ def make_url_analyzer():
         model_path=URL_MODEL,
         ml_only_mode=False,          # Heuristic+ML mode
         borderline_threshold=0.15,
-        standalone_ml_threshold=0.97,
+        standalone_ml_threshold=0.90,
+        ml_conf_threshold=0.90,
     )
 
 

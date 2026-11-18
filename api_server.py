@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from phish_reimpl.dataset import CaseSample
 from phish_reimpl.url_analysis import URLAnalyzer
-from phish_reimpl.inference import PhishingPipeline   # YOLOv8 + URL (Heuristic+ML)
+from phish_reimpl.inference import PhishingPipeline, url_model_path   # YOLOv8 + URL (Heuristic+ML)
 
 _pipeline: "PhishingPipeline | None" = None
 _pipeline_error: str | None = None           # set if pipeline failed to load
@@ -62,9 +62,10 @@ async def _lifespan(_: FastAPI):
         root = _find_workspace_root() if os.environ.get("PHISH_WORKSPACE") else Path(__file__).resolve().parent
         _url_only = URLAnalyzer(
             domain_map_path=root / "assets" / "models" / "domain_map.pkl",
-            model_path=root / "artifacts" / "url_rf_combined.pkl",
+            model_path=url_model_path(root),
             ml_only_mode=False,
-            standalone_ml_threshold=0.97,
+            standalone_ml_threshold=0.90,
+            ml_conf_threshold=0.90,
             borderline_threshold=0.15,
         )
         yield
@@ -77,7 +78,7 @@ async def _lifespan(_: FastAPI):
         workspace = _find_workspace_root()
         print(f"[startup] Workspace root: {workspace}")
         _pipeline = PhishingPipeline(workspace_root=workspace)
-        print("[startup] Full pipeline loaded: YOLOv8 + Heuristic+ML (url_rf_combined 125k)")
+        print("[startup] Full pipeline loaded: YOLOv8 + Heuristic+ML (retrained path-aware URL RF)")
     except Exception as e:
         _pipeline_error = f"{type(e).__name__}: {e}"
         print(f"[startup] *** PIPELINE FAILED TO LOAD ***")
@@ -116,6 +117,7 @@ class AnalyzeResponse(BaseModel):
     url_pred: int   = Field(description="Raw URL branch output (0=benign, 1=phish)")
     url_risk: float
     url_time: float
+    reason: str | None = Field(default=None, description="Why it was flagged; with final_pred 0, a weaker warning")
     mode: str       = Field(description="'full' = YOLOv8+URL, 'url_only' = URL branch only")
 
 
@@ -135,6 +137,7 @@ def _result_to_response(row, mode: str) -> AnalyzeResponse:
         url_pred=row.url_pred,
         url_risk=row.url_risk,
         url_time=row.url_time,
+        reason=getattr(row, "reason", None),
         mode=mode,
     )
 
@@ -151,7 +154,7 @@ def health() -> dict:
     out: dict = {
         "status": "ok" if mode != "down" else "error",
         "mode": mode,
-        "model": "YOLOv8 + Heuristic+ML (url_rf_combined 125k)",
+        "model": "YOLOv8 + Heuristic+ML (retrained path-aware URL RF)",
     }
     if _pipeline_error:
         out["pipeline_error"] = _pipeline_error
@@ -162,6 +165,7 @@ def health() -> dict:
 async def analyze(
     url: str = Form(..., description="Full URL of the current browser tab"),
     screenshot: UploadFile = File(..., description="PNG screenshot of the visible tab"),
+    html: UploadFile | None = File(None, description="Optional page HTML file (enables the login-form check)"),
 ) -> AnalyzeResponse:
     # Visual pipeline failed to load — surface the actual error instead of silently degrading
     if _pipeline is None and _url_only is None:
@@ -181,11 +185,16 @@ async def analyze(
     if len(raw) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="screenshot too large (max 25 MB)")
 
+    page_html: str | None = None
+    if html is not None:
+        # sent as a file: text form fields are capped at 1 MB, real pages are bigger
+        page_html = (await html.read(_MAX_UPLOAD_BYTES)).decode("utf-8", errors="ignore") or None
+
     case_id = f"ext-{uuid.uuid4().hex[:12]}"
 
     # ── Explicit URL-only mode (PHISH_URL_ONLY=1) ────────────────────────────
     if _url_only is not None:
-        url_out = _url_only.analyze(u)
+        url_out = _url_only.analyze(u, page_html)
         # URL-only mode never produces a real ResultRow (that's built by
         # PhishingPipeline.analyze_case, which isn't invoked here) — this
         # builds a minimal stand-in object with the same attributes so
@@ -202,6 +211,7 @@ async def analyze(
             "url_pred":        url_out.prediction,
             "url_risk":        url_out.risk_score,
             "url_time":        url_out.analysis_time,
+            "reason":          url_out.reason,
         })()
         return _result_to_response(row_like, mode="url_only")
 
@@ -210,24 +220,31 @@ async def analyze(
     # the uploaded screenshot is spooled to a temp file for the duration of
     # this request and always cleaned up in the `finally` block below
     tmp_path: Path | None = None
+    html_tmp: Path | None = None
     try:
         import tempfile as _tmp
         fd, tmp_str = _tmp.mkstemp(suffix=".png")
         os.close(fd)
         tmp_path = Path(tmp_str)
         tmp_path.write_bytes(raw)
+        if page_html:
+            fd, html_str = _tmp.mkstemp(suffix=".html")
+            os.close(fd)
+            html_tmp = Path(html_str)
+            html_tmp.write_text(page_html, errors="ignore")
 
         case = CaseSample(
             case_id=case_id,
             url=u,
             screenshot_path=tmp_path,
-            html_path=None,
+            html_path=html_tmp,
         )
         row = _pipeline.analyze_case(case)  # type: ignore[union-attr]
         return _result_to_response(row, mode="full")
     finally:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        for p in (tmp_path, html_tmp):
+            if p is not None and p.exists():
+                p.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -235,7 +252,7 @@ def main() -> None:
     host = os.environ.get("API_HOST", "127.0.0.1")
     port = int(os.environ.get("API_PORT", "8765"))
     print(f"Starting Phishpedia API on {host}:{port}")
-    print("Model: YOLOv8 + Heuristic+ML (url_rf_combined 125k)")
+    print("Model: YOLOv8 + Heuristic+ML (retrained path-aware URL RF)")
     uvicorn.run("api_server:app", host=host, port=port, reload=False)
 
 

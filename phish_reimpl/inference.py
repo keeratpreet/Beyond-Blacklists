@@ -8,6 +8,12 @@ from phish_reimpl.url_analysis import URLAnalyzer
 from phish_reimpl.visual_yolo import YoloVisualAnalyzer   # YOLOv8 — final chosen detector
 
 
+def url_model_path(workspace_root: Path) -> Path:
+    """The URL model to load: retrained path-aware model if present."""
+    new = workspace_root / "artifacts" / "url_rf_pathaware.pkl"
+    return new if new.exists() else workspace_root / "artifacts" / "url_rf_combined.pkl"
+
+
 class PhishingPipeline:
     """
     Final production pipeline: YOLOv8 visual branch + Heuristic+ML URL branch
@@ -24,18 +30,29 @@ class PhishingPipeline:
             yolo_weights_path=self.workspace_root / "yolo" / "best.pt",
         )
 
-        # ── URL branch: Heuristic+ML mode, new combined 125k model ───────
+        # ── URL branch: Heuristic+ML mode ────────────────────────────────
+        # Prefer the retrained path-aware model (trained with real inner-page
+        # URLs, see train_url_model_v2.py); fall back to the original model,
+        # which URLAnalyzer then only shows the hostname.
         self.url_branch = URLAnalyzer(
             domain_map_path=self.workspace_root / "assets" / "models" / "domain_map.pkl",
-            model_path=self.workspace_root / "artifacts" / "url_rf_combined.pkl",
+            model_path=url_model_path(self.workspace_root),
             ml_only_mode=False,           # Heuristic+ML mode
-            standalone_ml_threshold=0.97,
+            standalone_ml_threshold=0.90,
+            ml_conf_threshold=0.90,
             borderline_threshold=0.15,
         )
 
     def analyze_case(self, case: CaseSample) -> ResultRow:
         visual_out = self.visual.analyze(case)
-        url_out    = self.url_branch.analyze(case.url)
+        html = None
+        if case.html_path is not None and Path(case.html_path).exists():
+            html = Path(case.html_path).read_text(errors="ignore")
+        url_out    = self.url_branch.analyze(case.url, html)
+        reason = url_out.reason
+        if visual_out.prediction == 1:
+            reason = (f"{visual_out.predicted_brand} logo on a site that is not "
+                      f"{visual_out.predicted_brand}'s")
 
         # Primary decision comes from visual branch.
         # URL branch overrides only when visual says benign but URL flags phishing.
@@ -64,4 +81,5 @@ class PhishingPipeline:
             url_pred=url_out.prediction,
             url_risk=url_out.risk_score,
             url_time=url_out.analysis_time,
+            reason=reason,
         )
