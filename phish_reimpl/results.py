@@ -17,6 +17,7 @@ class ResultRow:
     url_pred: int
     url_risk: float
     url_time: float
+    reason: str | None = None   # why it was flagged (or a weaker warning)
 
 
 HEADER = (

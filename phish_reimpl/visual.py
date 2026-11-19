@@ -12,8 +12,6 @@ import numpy as np
 import torch
 import tldextract
 from PIL import Image, ImageOps
-from detectron2.config import get_cfg
-from detectron2.engine import DefaultPredictor
 from torchvision import transforms
 
 from .backbone import KNOWN_MODELS
@@ -110,10 +108,20 @@ class VisualAnalyzer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self._load_siamese_model()
         self.domain_map = self._load_domain_map()
+        for brand, extra in self._EXTRA_DOMAINS.items():
+            known = list(self.domain_map.get(brand, []))
+            self.domain_map[brand] = known + [d for d in extra if d not in known]
         self.reference_entries = self._load_reference_entries()
         self.reference_matrix = np.array([entry.embedding for entry in self.reference_entries])
 
-    def _load_detector(self) -> DefaultPredictor:
+    def _load_detector(self):
+        # detectron2 is only needed by the original Faster R-CNN detector; the
+        # YOLO subclass overrides this method, so import lazily. (A top-level
+        # import made the whole package fail when detectron2 isn't installed,
+        # and it is not in requirements-api.txt.)
+        from detectron2.config import get_cfg
+        from detectron2.engine import DefaultPredictor
+
         cfg = get_cfg()
         cfg.merge_from_file(str(self.detector_cfg_path))
         cfg.MODEL.WEIGHTS = str(self.detector_weights_path)
@@ -162,7 +170,28 @@ class VisualAnalyzer:
             feature = self.model.features(tensor.unsqueeze(0).to(self.device))
         return _l2_normalize(feature).squeeze(0).cpu().numpy()
 
+    # Logo folders whose names have no key in domain_map. Without these aliases
+    # the folders were silently skipped, so Office365 / OneDrive / Outlook / DHL
+    # (92 logos, some of the most-phished brands) had no reference logos at all.
+    _FOLDER_BRANDS = {
+        "Office365": "Microsoft",
+        "Microsoft OneDrive": "Microsoft",
+        "Outlook": "Microsoft",
+        "DHL": "DHL",
+        "Simplii Financial": "Simplii Financial",
+    }
+    _EXTRA_DOMAINS = {
+        "Microsoft": ["microsoft.com", "microsoftonline.com", "live.com", "office.com",
+                      "office365.com", "outlook.com", "onedrive.com", "sharepoint.com",
+                      "bing.com", "msn.com", "skype.com", "xbox.com", "windows.com"],
+        "DHL": ["dhl.com", "dhl.de", "dhl.co.uk", "logistics.dhl", "dhlparcel.nl",
+                "dhlecommerce.com", "dhl.fr", "dhl.it", "dhl.es"],
+        "Simplii Financial": ["simplii.com"],
+    }
+
     def _resolve_brand_name(self, folder_name: str) -> str | None:
+        if folder_name in self._FOLDER_BRANDS:
+            return self._FOLDER_BRANDS[folder_name]
         normalized = _normalize_key(folder_name)
         if folder_name in self.domain_map:
             return folder_name
@@ -190,7 +219,8 @@ class VisualAnalyzer:
                 yield brand, domains, image_path
 
     def _load_reference_entries(self) -> list[ReferenceEntry]:
-        cache_path = self.cache_dir / "reference_embeddings.pkl"
+        # v2: rebuilt after adding _FOLDER_BRANDS (old caches lack those brands)
+        cache_path = self.cache_dir / "reference_embeddings_v2.pkl"
         if cache_path.exists():
             with cache_path.open("rb") as handle:
                 cached_entries: list[ReferenceEntry] = pickle.load(handle)
@@ -342,6 +372,11 @@ class VisualAnalyzer:
         ".uy",".uz",".vu",".va",".ve",".vn",".wf",".eh",".ma",".ye",".zm",".zw",
     })
 
+    # Country TLDs that anyone can register cheaply/freely or that are sold as
+    # generic endings. "amazon.tk" must NOT count as Amazon's country site.
+    _OPEN_TLDS = frozenset({".tk", ".ml", ".ga", ".cf", ".gq", ".pw", ".cc", ".ws",
+                            ".co", ".io", ".me", ".tv", ".to", ".nu", ".su", ".ly"})
+
     def _is_domain_consistent(self, url: str, domains: list[str]) -> bool:
         import tldextract as _tldextract
         from urllib.parse import urlparse
@@ -369,7 +404,7 @@ class VisualAnalyzer:
         #    (mirrors `elif domain_part in matched_domain_parts` + COUNTRY_TLDs check)
         last_suffix_part = "." + suffix_part.split(".")[-1] if suffix_part else ""
         if domain_part and domain_part in official_domain_parts:
-            if last_suffix_part in self._COUNTRY_TLDS:
+            if last_suffix_part in self._COUNTRY_TLDS and last_suffix_part not in self._OPEN_TLDS:
                 return True
 
         return False
